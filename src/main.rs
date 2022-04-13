@@ -28,10 +28,10 @@ struct Chunk {
 }
 
 impl Chunk {
-    fn from_asset(asset_id: NodeIndex, asset: &JsModule) -> Self {
+    fn from_js_module(module_idx: NodeIndex, module: &JsModule) -> Self {
         Chunk {
-            module_ids: vec![asset_id],
-            size: asset.size,
+            module_ids: vec![module_idx],
+            size: module.size,
             source_bundles: vec![],
         }
     }
@@ -48,27 +48,28 @@ fn main() {
     // Step 1: Create chunks at the explicit split points in the graph.
     // Create chunks for each entry.
     for entry in &entries {
-        let chunk_id = chunk_graph.add_node(Chunk::from_asset(*entry, &g[*entry]));
+        let chunk_id = chunk_graph.add_node(Chunk::from_js_module(*entry, &g[*entry]));
         chunk_roots.insert(*entry, (chunk_id, chunk_id));
     }
 
-    // Traverse the module graph and create chunks for asset type changes and async dependencies.
+    // Traverse the module graph and create chunks for async dependencies or other condition.
     // This only adds the module asset of each chunk, not the subgraph.
     let mut stack = LinkedList::new();
     depth_first_search(&g, entries, |event| {
         match event {
-            DfsEvent::Discover(asset_id, _) => {
+            DfsEvent::Discover(module_idx, _) => {
                 // Push to the stack when a new chunk is created.
-                if let Some((_, chunk_group_id)) = chunk_roots.get(&asset_id) {
-                    stack.push_front((asset_id, *chunk_group_id));
+                if let Some((_, chunk_group_id)) = chunk_roots.get(&module_idx) {
+                    // stack 的队头表示的 chunk 入口模块的 图索引 和其所属的 chunk 的 id
+                    stack.push_front((module_idx, *chunk_group_id));
                 }
             }
             DfsEvent::TreeEdge(importer_id, importee_id) => {
                 // Create a new bundle as well as a new bundle group if the dependency is async.
                 let dependency = &g[g.find_edge(importer_id, importee_id).unwrap()];
                 if dependency.is_async {
-                    let chunk_id =
-                        chunk_graph.add_node(Chunk::from_asset(importee_id, &g[importee_id]));
+                    let chunk = Chunk::from_js_module(importee_id, &g[importee_id]);
+                    let chunk_id = chunk_graph.add_node(chunk);
                     chunk_roots.insert(importee_id, (chunk_id, chunk_id));
 
                     // Walk up the stack until we hit a different asset type
@@ -93,30 +94,32 @@ fn main() {
     println!("roots {:?}", chunk_roots);
     println!("reachable {:?}", reachable_chunks);
     println!("initial bundle graph {:?}", Dot::new(&chunk_graph));
+    // 此时 chunk_graph 中的每一个 chunk 仅包含自己的入口模块
 
-    // Step 2: Determine reachability for every asset from each bundle root.
-    // This is later used to determine which bundles to place each asset in.
-    let mut reachable_nodes = HashSet::new();
-    for (root, _) in &chunk_roots {
-        depth_first_search(&g, Some(*root), |event| {
-            if let DfsEvent::Discover(n, _) = &event {
-                if n == root {
+    // Step 2: Determine reachability for every module from each chunk root.
+    // This is later used to determine which chunk to place each module in.
+    let mut reachable_modules = HashSet::new();
+
+    for (root_which_is_node_idx_of_module, _) in &chunk_roots {
+        depth_first_search(&g, Some(*root_which_is_node_idx_of_module), |event| {
+            if let DfsEvent::Discover(node_idx_of_visiting_module, _) = &event {
+                if node_idx_of_visiting_module == root_which_is_node_idx_of_module {
                     return Control::Continue;
                 }
 
                 // Stop when we hit another bundle root.
-                if chunk_roots.contains_key(&n) {
+                if chunk_roots.contains_key(&node_idx_of_visiting_module) {
                     return Control::<()>::Prune;
                 }
 
-                reachable_nodes.insert((*root, *n));
+                reachable_modules.insert((*root_which_is_node_idx_of_module, *node_idx_of_visiting_module));
             }
             Control::Continue
         });
     }
 
-    let reachable_graph = Graph::<(), ()>::from_edges(&reachable_nodes);
-    println!("{:?}", Dot::new(&reachable_graph));
+    let reachable_graph = Graph::<(), ()>::from_edges(&reachable_modules);
+    println!("reachable_graph {:?}", Dot::new(&reachable_graph));
 
     // Step 3: Place all assets into bundles. Each asset is placed into a single
     // bundle based on the bundle entries it is reachable from. This creates a
