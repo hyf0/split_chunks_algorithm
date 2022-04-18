@@ -41,6 +41,8 @@ fn main() {
     let (g, entries) = build_graph();
     println!("{:?}", Dot::new(&g));
 
+
+    // 存的是 chunk 的入口模块的 id 和对应的 chunk id组成的元组
     let mut chunk_roots = HashMap::new();
     let mut reachable_chunks = HashSet::new();
     let mut chunk_graph = Graph::new();
@@ -54,10 +56,13 @@ fn main() {
 
     // Traverse the module graph and create chunks for async dependencies or other condition.
     // This only adds the module asset of each chunk, not the subgraph.
+    // stack 的队头表示的当前 chunk 入口模块的 图索引 和其所属的 chunk 的 id
+    // stack 的 n + 1 位置的 chunk 是 n 的父 chunk ，即 chunk (n) import 了 chunk (n + 1)
     let mut stack = LinkedList::new();
     depth_first_search(&g, entries, |event| {
         match event {
             DfsEvent::Discover(module_idx, _) => {
+                // println!("Discover {:?}", module_idx);
                 // Push to the stack when a new chunk is created.
                 if let Some((_, chunk_group_id)) = chunk_roots.get(&module_idx) {
                     // stack 的队头表示的 chunk 入口模块的 图索引 和其所属的 chunk 的 id
@@ -65,6 +70,7 @@ fn main() {
                 }
             }
             DfsEvent::TreeEdge(importer_id, importee_id) => {
+                // println!("TreeEdge from {:?} to {:?}", importer_id, importee_id);
                 // Create a new bundle as well as a new bundle group if the dependency is async.
                 let dependency = &g[g.find_edge(importer_id, importee_id).unwrap()];
                 if dependency.is_async {
@@ -74,12 +80,13 @@ fn main() {
 
                     // Walk up the stack until we hit a different asset type
                     // and mark each this bundle as reachable from every parent bundle.
-                    for (module_id, _) in &stack {
-                        reachable_chunks.insert((*module_id, importee_id));
+                    for (chunk_entry_module_idx, _) in &stack {
+                        reachable_chunks.insert((*chunk_entry_module_idx, importee_id));
                     }
                 }
             }
             DfsEvent::Finish(finished_module_id, _) => {
+              // println!("Finish {:?}", finished_module_id);
                 // Pop the stack when existing the asset node that created a bundle.
                 if let Some((module_id, _)) = stack.front() {
                     if *module_id == finished_module_id {
@@ -90,51 +97,52 @@ fn main() {
             _ => {}
         }
     });
-
-    println!("roots {:?}", chunk_roots);
-    println!("reachable {:?}", reachable_chunks);
-    println!("initial bundle graph {:?}", Dot::new(&chunk_graph));
+    // chunk_roots 
+    println!("roots {:#?}", chunk_roots);
+    // reachable 存储着 entry chunk module 到各个 chunk entry module 之间的边，不存在说明对应模块不可达
+    println!("reachable_chunks {:?}", reachable_chunks);
+    println!("initial chunk graph {:?}", Dot::new(&chunk_graph));
     // 此时 chunk_graph 中的每一个 chunk 仅包含自己的入口模块
 
     // Step 2: Determine reachability for every module from each chunk root.
     // This is later used to determine which chunk to place each module in.
     let mut reachable_modules = HashSet::new();
 
-    for (root_which_is_node_idx_of_module, _) in &chunk_roots {
-        depth_first_search(&g, Some(*root_which_is_node_idx_of_module), |event| {
+    for (root_which_is_node_idx_of_chunks_entry_module, _) in &chunk_roots {
+        depth_first_search(&g, Some(*root_which_is_node_idx_of_chunks_entry_module), |event| {
             if let DfsEvent::Discover(node_idx_of_visiting_module, _) = &event {
-                if node_idx_of_visiting_module == root_which_is_node_idx_of_module {
+                if node_idx_of_visiting_module == root_which_is_node_idx_of_chunks_entry_module {
                     return Control::Continue;
                 }
 
-                // Stop when we hit another bundle root.
-                if chunk_roots.contains_key(&node_idx_of_visiting_module) {
-                    return Control::<()>::Prune;
-                }
+                reachable_modules.insert((*root_which_is_node_idx_of_chunks_entry_module, *node_idx_of_visiting_module));
 
-                reachable_modules.insert((*root_which_is_node_idx_of_module, *node_idx_of_visiting_module));
+                 // Stop when we hit another bundle root.
+                 if chunk_roots.contains_key(&node_idx_of_visiting_module) {
+                  return Control::<()>::Prune;
+              }
             }
             Control::Continue
         });
     }
 
-    let reachable_graph = Graph::<(), ()>::from_edges(&reachable_modules);
-    println!("reachable_graph {:?}", Dot::new(&reachable_graph));
+    let reachable_module_graph = Graph::<(), ()>::from_edges(&reachable_modules);
+    println!("reachable_module_graph {:?}", Dot::new(&reachable_module_graph));
 
-    // Step 3: Place all assets into bundles. Each asset is placed into a single
-    // bundle based on the bundle entries it is reachable from. This creates a
-    // maximally code split bundle graph with no duplication.
+    // Step 3: Place all modules into chunks. Each module is placed into a single
+    // chunk based on the chunk entries it is reachable from. This creates a
+    // maximally code split chunk graph with no duplication.
 
-    // Create a mapping from entry asset ids to bundle ids.
-    let mut bundles: HashMap<Vec<NodeIndex>, NodeIndex> = HashMap::new();
+    // Create a mapping from entry module ids to chunk ids.
+    let mut chunks: HashMap<Vec<NodeIndex>, NodeIndex> = HashMap::new();
 
-    for asset_id in g.node_indices() {
-        // Find bundle entries reachable from the asset.
-        let reachable: Vec<NodeIndex> = reachable_graph
-            .neighbors_directed(asset_id, Incoming)
+    for module_id in g.node_indices() {
+        // Find chunk entries reachable from the module.
+        let reachable: Vec<NodeIndex> = reachable_module_graph
+            .neighbors_directed(module_id, Incoming)
             .collect();
-
-        // Filter out bundles when the asset is reachable in a parent bundle.
+        println!("original reachable: {:?} for {:?}", reachable, module_id);
+        // Filter out chunks when the module is reachable in a parent chunk.
         let reachable: Vec<NodeIndex> = reachable
             .iter()
             .cloned()
@@ -145,36 +153,41 @@ fn main() {
             })
             .collect();
 
-        if let Some((bundle_id, _)) = chunk_roots.get(&asset_id) {
-            // If the asset is a bundle root, add the bundle to every other reachable bundle group.
-            bundles.entry(vec![asset_id]).or_insert(*bundle_id);
+          println!("filtered reachable: {:?}", reachable);
+
+        if let Some((chunk_id, _)) = chunk_roots.get(&module_id) {
+            // If the module is a chunk root, add the chunk to every other reachable chunk group.
+            chunks.entry(vec![module_id]).or_insert(*chunk_id);
             for a in &reachable {
-                if *a != asset_id {
-                    chunk_graph.add_edge(chunk_roots[a].1, *bundle_id, 0);
+                if *a != module_id {
+                    chunk_graph.add_edge(chunk_roots[a].1, *chunk_id, 0);
                 }
             }
         } else if reachable.len() > 0 {
             // If the asset is reachable from more than one entry, find or create
-            // a bundle for that combination of entries, and add the asset to it.
-            let source_bundles = reachable.iter().map(|a| bundles[&vec![*a]]).collect();
-            let bundle_id = bundles.entry(reachable.clone()).or_insert_with(|| {
+            // a chunk for that combination of entries, and add the asset to it.
+            let source_chunks = reachable.iter().map(|a| chunks[&vec![*a]]).collect();
+            // 这里创建了共享模块的 chunk
+            let chunk_id = chunks.entry(reachable.clone()).or_insert_with(|| {
                 let mut bundle = Chunk::default();
-                bundle.source_bundles = source_bundles;
+                bundle.source_bundles = source_chunks;
                 chunk_graph.add_node(bundle)
             });
 
-            let bundle = &mut chunk_graph[*bundle_id];
-            bundle.module_ids.push(asset_id);
-            bundle.size += g[asset_id].size;
+            let bundle = &mut chunk_graph[*chunk_id];
+            bundle.module_ids.push(module_id);
+            bundle.size += g[module_id].size;
 
             // Add the bundle to each reachable bundle group.
             for a in reachable {
-                if a != *bundle_id {
-                    chunk_graph.add_edge(chunk_roots[&a].1, *bundle_id, 0);
+                if a != *chunk_id {
+                    chunk_graph.add_edge(chunk_roots[&a].1, *chunk_id, 0);
                 }
             }
         }
     }
+
+        println!("chunk_graph in step3: {:#?}", Dot::new(&chunk_graph));
 
     // Step 4: Remove shared bundles that are smaller than the minimum size,
     // and add the assets to the original source bundles they were referenced from.
@@ -183,52 +196,6 @@ fn main() {
         let bundle = &chunk_graph[bundle_id];
         if bundle.source_bundles.len() > 0 && bundle.size < 10 {
             remove_bundle(&g, &mut chunk_graph, bundle_id);
-        }
-    }
-
-    // Step 5: Remove shared bundles from bundle groups that hit the parallel request limit.
-    let limit = usize::MAX;
-    for (_, (bundle_id, bundle_group_id)) in chunk_roots {
-        // Only handle bundle group entries.
-        if bundle_id != bundle_group_id {
-            continue;
-        }
-
-        // Find the bundles in this bundle group.
-        let mut neighbors: Vec<NodeIndex> = chunk_graph.neighbors(bundle_group_id).collect();
-        if neighbors.len() > limit {
-            // Sort the bundles so the smallest ones are removed first.
-            neighbors.sort_by(|a, b| chunk_graph[*a].size.cmp(&chunk_graph[*b].size));
-
-            // Remove bundles until the bundle group is within the parallel request limit.
-            for bundle_id in &neighbors[0..neighbors.len() - limit] {
-                // Add all assets in the shared bundle into the source bundles that are within this bundle group.
-                let source_bundles: Vec<NodeIndex> = chunk_graph[*bundle_id]
-                    .source_bundles
-                    .drain_filter(|s| neighbors.contains(s))
-                    .collect();
-                for source in source_bundles {
-                    for asset_id in chunk_graph[*bundle_id].module_ids.clone() {
-                        let bundle_id = bundles[&vec![source]];
-                        let bundle = &mut chunk_graph[bundle_id];
-                        bundle.module_ids.push(asset_id);
-                        bundle.size += g[asset_id].size;
-                    }
-                }
-
-                // Remove the edge from this bundle group to the shared bundle.
-                chunk_graph
-                    .remove_edge(chunk_graph.find_edge(bundle_group_id, *bundle_id).unwrap());
-
-                // If there is now only a single bundle group that contains this bundle,
-                // merge it into the remaining source bundles. If it is orphaned entirely, remove it.
-                let count = chunk_graph.neighbors_directed(*bundle_id, Incoming).count();
-                if count == 1 {
-                    remove_bundle(&g, &mut chunk_graph, *bundle_id);
-                } else if count == 0 {
-                    chunk_graph.remove_node(*bundle_id);
-                }
-            }
         }
     }
 
@@ -302,6 +269,7 @@ fn build_graph<'a>() -> (Graph<JsModule<'a>, Dependency>, Vec<NodeIndex>) {
     g.add_edge(entry_a_js, asynced_a_js, Dependency { is_async: true });
     g.add_edge(entry_a_js, shared_js, Dependency { is_async: false });
     g.add_edge(entry_b_js, b_js, Dependency { is_async: false });
+    // g.add_edge(entry_b_js, asynced_a_js, Dependency { is_async: true });
     g.add_edge(entry_b_js, shared_js, Dependency { is_async: false });
 
     entries.push(entry_a_js);
