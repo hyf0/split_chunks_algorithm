@@ -157,7 +157,7 @@ fn main() {
             .collect();
 
           println!("filtered reachable: {:?}", reachable);
-
+        
         if let Some((chunk_id, _)) = chunk_roots.get(&module_id) {
             // If the module is a chunk root, add the chunk to every other reachable chunk group.
             chunks.entry(vec![module_id]).or_insert(*chunk_id);
@@ -169,6 +169,7 @@ fn main() {
         } else if reachable.len() > 0 {
             // If the asset is reachable from more than one entry, find or create
             // a chunk for that combination of entries, and add the asset to it.
+            // 这段代码依赖了chunk的【入口模块】先于普通模块被遍历到，否则在 chunks 里面取值的时候会取不到 panic
             let source_chunks = reachable.iter().map(|a| chunks[&vec![*a]]).collect();
             // 这里创建了共享模块的 chunk
             let chunk_id = chunks.entry(reachable.clone()).or_insert_with(|| {
