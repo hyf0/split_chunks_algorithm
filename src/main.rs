@@ -114,7 +114,10 @@ fn main() {
                 if node_idx_of_visiting_module == root_which_is_node_idx_of_chunks_entry_module {
                     return Control::Continue;
                 }
-
+                
+                // 注意这里创建的边是摊平的，是【入口模块】直接连接到可达的模块
+                // 对于依赖入口模块 A 假设有 module graph A -> B -> C
+                // 我们能得到 reachable grapg ， A -> B ， A -> C
                 reachable_modules.insert((*root_which_is_node_idx_of_chunks_entry_module, *node_idx_of_visiting_module));
 
                  // Stop when we hit another bundle root.
