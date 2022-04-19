@@ -3,6 +3,7 @@
 
 extern crate petgraph;
 
+use petgraph::data::Build;
 use petgraph::dot::Dot;
 use petgraph::prelude::{Incoming, NodeIndex};
 use petgraph::visit::{depth_first_search, Control, DfsEvent};
@@ -10,8 +11,8 @@ use petgraph::Graph;
 use std::collections::{HashMap, HashSet, LinkedList};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct JsModule<'a> {
-    name: &'a str,
+struct JsModule {
+    name: ModuleId,
     size: usize,
 }
 
@@ -22,15 +23,15 @@ struct Dependency {
 
 #[derive(Debug, Default)]
 struct Chunk {
-    module_ids: Vec<NodeIndex>,
+    module_ids: Vec<ModuleId>,
     size: usize,
     source_bundles: Vec<NodeIndex>,
 }
 
 impl Chunk {
-    fn from_js_module(module_idx: NodeIndex, module: &JsModule) -> Self {
+    fn from_js_module(module_id: ModuleId, module: &JsModule) -> Self {
         Chunk {
-            module_ids: vec![module_idx],
+            module_ids: vec![module_id],
             size: module.size,
             source_bundles: vec![],
         }
@@ -38,9 +39,8 @@ impl Chunk {
 }
 
 fn main() {
-    let (g, entries) = build_graph();
+    let (g, entries, module_by_id) = build_graph();
     println!("{:?}", Dot::new(&g));
-
 
     // 存的是 chunk 的入口模块的 id 和对应的 chunk id组成的元组
     let mut chunk_roots = HashMap::new();
@@ -50,7 +50,7 @@ fn main() {
     // Step 1: Create chunks at the explicit split points in the graph.
     // Create chunks for each entry.
     for entry in &entries {
-        let chunk_id = chunk_graph.add_node(Chunk::from_js_module(*entry, &g[*entry]));
+        let chunk_id = chunk_graph.add_node(Chunk::from_js_module(*entry, &module_by_id[*entry]));
         chunk_roots.insert(*entry, (chunk_id, chunk_id));
     }
 
@@ -72,9 +72,10 @@ fn main() {
             DfsEvent::TreeEdge(importer_id, importee_id) => {
                 // println!("TreeEdge from {:?} to {:?}", importer_id, importee_id);
                 // Create a new bundle as well as a new bundle group if the dependency is async.
-                let dependency = &g[g.find_edge(importer_id, importee_id).unwrap()];
+
+                let dependency = &g[(importer_id, importee_id)];
                 if dependency.is_async {
-                    let chunk = Chunk::from_js_module(importee_id, &g[importee_id]);
+                    let chunk = Chunk::from_js_module(importee_id, &module_by_id[importee_id]);
                     let chunk_id = chunk_graph.add_node(chunk);
                     chunk_roots.insert(importee_id, (chunk_id, chunk_id));
 
@@ -86,7 +87,7 @@ fn main() {
                 }
             }
             DfsEvent::Finish(finished_module_id, _) => {
-              // println!("Finish {:?}", finished_module_id);
+                // println!("Finish {:?}", finished_module_id);
                 // Pop the stack when existing the asset node that created a bundle.
                 if let Some((module_id, _)) = stack.front() {
                     if *module_id == finished_module_id {
@@ -97,8 +98,8 @@ fn main() {
             _ => {}
         }
     });
-    // chunk_roots 
-    println!("roots {:#?}", chunk_roots);
+    // chunk_roots
+    println!("chunk_roots roots {:#?}", chunk_roots);
     // reachable 存储着 entry chunk module 到各个 chunk entry module 之间的边，不存在说明对应模块不可达
     println!("reachable_chunks {:?}", reachable_chunks);
     println!("initial chunk graph {:?}", Dot::new(&chunk_graph));
@@ -109,44 +110,55 @@ fn main() {
     let mut reachable_modules = HashSet::new();
 
     for (root_which_is_node_idx_of_chunks_entry_module, _) in &chunk_roots {
-        depth_first_search(&g, Some(*root_which_is_node_idx_of_chunks_entry_module), |event| {
-            if let DfsEvent::Discover(node_idx_of_visiting_module, _) = &event {
-                if node_idx_of_visiting_module == root_which_is_node_idx_of_chunks_entry_module {
-                    return Control::Continue;
-                }
-                
-                // 注意这里创建的边是摊平的，是【入口模块】直接连接到可达的模块
-                // 对于依赖入口模块 A 假设有 module graph A -> B -> C
-                // 我们能得到 reachable grapg ， A -> B ， A -> C
-                reachable_modules.insert((*root_which_is_node_idx_of_chunks_entry_module, *node_idx_of_visiting_module));
+        depth_first_search(
+            &g,
+            Some(*root_which_is_node_idx_of_chunks_entry_module),
+            |event| {
+                if let DfsEvent::Discover(node_idx_of_visiting_module, _) = &event {
+                    if node_idx_of_visiting_module == root_which_is_node_idx_of_chunks_entry_module
+                    {
+                        return Control::Continue;
+                    }
 
-                 // Stop when we hit another bundle root.
-                 if chunk_roots.contains_key(&node_idx_of_visiting_module) {
-                  return Control::<()>::Prune;
-              }
-            }
-            Control::Continue
-        });
+                    // 注意这里创建的边是摊平的，是【入口模块】直接连接到可达的模块
+                    // 对于依赖入口模块 A 假设有 module graph A -> B -> C
+                    // 我们能得到 reachable grapg ， A -> B ， A -> C
+                    reachable_modules.insert((
+                        *root_which_is_node_idx_of_chunks_entry_module,
+                        *node_idx_of_visiting_module,
+                    ));
+
+                    // Stop when we hit another bundle root.
+                    if chunk_roots.contains_key(*node_idx_of_visiting_module) {
+                        return Control::<()>::Prune;
+                    }
+                }
+                Control::Continue
+            },
+        );
     }
 
-    let reachable_module_graph = Graph::<(), ()>::from_edges(&reachable_modules);
-    println!("reachable_module_graph {:?}", Dot::new(&reachable_module_graph));
+    let reachable_module_graph = petgraph::graphmap::DiGraphMap::<&'static str, ()>::from_edges(&reachable_modules);
+    println!(
+        "reachable_module_graph {:?}",
+        Dot::new(&reachable_module_graph)
+    );
 
     // Step 3: Place all modules into chunks. Each module is placed into a single
     // chunk based on the chunk entries it is reachable from. This creates a
     // maximally code split chunk graph with no duplication.
 
     // Create a mapping from entry module ids to chunk ids.
-    let mut chunks: HashMap<Vec<NodeIndex>, NodeIndex> = HashMap::new();
+    let mut chunks: HashMap<Vec<ModuleId>, NodeIndex> = HashMap::new();
 
-    for module_id in g.node_indices() {
+    for module_id in g.nodes() {
         // Find chunk entries reachable from the module.
-        let reachable: Vec<NodeIndex> = reachable_module_graph
+        let reachable: Vec<&'static str> = reachable_module_graph
             .neighbors_directed(module_id, Incoming)
             .collect();
         println!("original reachable: {:?} for {:?}", reachable, module_id);
         // Filter out chunks when the module is reachable in a parent chunk.
-        let reachable: Vec<NodeIndex> = reachable
+        let reachable: Vec<&'static str> = reachable
             .iter()
             .cloned()
             .filter(|b| {
@@ -156,8 +168,8 @@ fn main() {
             })
             .collect();
 
-          println!("filtered reachable: {:?}", reachable);
-        
+        println!("filtered reachable: {:?}", reachable);
+
         if let Some((chunk_id, _)) = chunk_roots.get(&module_id) {
             // If the module is a chunk root, add the chunk to every other reachable chunk group.
             chunks.entry(vec![module_id]).or_insert(*chunk_id);
@@ -170,7 +182,7 @@ fn main() {
             // If the asset is reachable from more than one entry, find or create
             // a chunk for that combination of entries, and add the asset to it.
             // 这段代码依赖了chunk的【入口模块】先于普通模块被遍历到，否则在 chunks 里面取值的时候会取不到 panic
-            let source_chunks = reachable.iter().map(|a| chunks[&vec![*a]]).collect();
+            let source_chunks = reachable.iter().map(|a| chunks[&vec![*a]]).collect::<Vec<_>>();
             // 这里创建了共享模块的 chunk
             let chunk_id = chunks.entry(reachable.clone()).or_insert_with(|| {
                 let mut bundle = Chunk::default();
@@ -180,28 +192,29 @@ fn main() {
 
             let bundle = &mut chunk_graph[*chunk_id];
             bundle.module_ids.push(module_id);
-            bundle.size += g[module_id].size;
+            bundle.size += module_by_id[module_id].size;
 
             // Add the bundle to each reachable bundle group.
-            for a in reachable {
-                if a != *chunk_id {
-                    chunk_graph.add_edge(chunk_roots[&a].1, *chunk_id, 0);
+            for item_module_id in reachable {
+                let item_chunk_id = chunk_roots[&item_module_id].1;
+                if item_chunk_id != *chunk_id {
+                    chunk_graph.add_edge(item_chunk_id, *chunk_id, 0);
                 }
             }
         }
     }
 
-        println!("chunk_graph in step3: {:#?}", Dot::new(&chunk_graph));
+    println!("chunk_graph in step3: {:#?}", Dot::new(&chunk_graph));
 
-    // Step 4: Remove shared bundles that are smaller than the minimum size,
-    // and add the assets to the original source bundles they were referenced from.
-    // This may result in duplication of assets in multiple bundles.
-    for bundle_id in chunk_graph.node_indices() {
-        let bundle = &chunk_graph[bundle_id];
-        if bundle.source_bundles.len() > 0 && bundle.size < 10 {
-            remove_bundle(&g, &mut chunk_graph, bundle_id);
-        }
-    }
+    // // Step 4: Remove shared bundles that are smaller than the minimum size,
+    // // and add the assets to the original source bundles they were referenced from.
+    // // This may result in duplication of assets in multiple bundles.
+    // for bundle_id in chunk_graph.node_indices() {
+    //     let bundle = &chunk_graph[bundle_id];
+    //     if bundle.source_bundles.len() > 0 && bundle.size < 10 {
+    //         remove_bundle(&g, &mut chunk_graph, bundle_id);
+    //     }
+    // }
 
     println!("chunk graph {:?}", Dot::new(&chunk_graph));
 
@@ -213,7 +226,7 @@ fn main() {
             chunk
                 .module_ids
                 .iter()
-                .map(|n| g[*n].name)
+                .map(|n| module_by_id[*n].name)
                 .collect::<Vec<&str>>()
                 .join(", "),
             chunk.size
@@ -221,53 +234,87 @@ fn main() {
     }
 }
 
-fn remove_bundle(
-    asset_graph: &Graph<JsModule, Dependency>,
-    bundle_graph: &mut Graph<Chunk, i32>,
-    bundle_id: NodeIndex,
-) {
-    let bundle = bundle_graph.remove_node(bundle_id).unwrap();
-    for asset_id in &bundle.module_ids {
-        for source_bundle_id in &bundle.source_bundles {
-            let bundle = &mut bundle_graph[*source_bundle_id];
-            bundle.module_ids.push(*asset_id);
-            bundle.size += asset_graph[*asset_id].size;
-        }
-    }
-}
+// fn remove_bundle(
+//     asset_graph: &Graph<JsModule, Dependency>,
+//     bundle_graph: &mut Graph<Chunk, i32>,
+//     bundle_id: NodeIndex,
+// ) {
+//     let bundle = bundle_graph.remove_node(bundle_id).unwrap();
+//     for asset_id in &bundle.module_ids {
+//         for source_bundle_id in &bundle.source_bundles {
+//             let bundle = &mut bundle_graph[*source_bundle_id];
+//             bundle.module_ids.push(*asset_id);
+//             bundle.size += asset_graph[*asset_id].size;
+//         }
+//     }
+// }
 
-fn build_graph<'a>() -> (Graph<JsModule<'a>, Dependency>, Vec<NodeIndex>) {
-    let mut g = Graph::new();
+type ModuleId = &'static str;
+
+type ModuleGraph = petgraph::graphmap::DiGraphMap<ModuleId, Dependency>;
+
+fn build_graph() -> (ModuleGraph, Vec<ModuleId>, HashMap<ModuleId, JsModule>) {
+    let mut module_by_id = HashMap::new();
+    let mut g = ModuleGraph::new();
     let mut entries = Vec::new();
 
-    let entry_a_js = g.add_node(JsModule {
-        name: "entry-a.js",
-        size: 1000,
-    });
+    module_by_id.insert(
+        "entry-a.js",
+        JsModule {
+            name: "entry-a.js",
+            size: 1000,
+        },
+    );
 
-    let entry_b_js = g.add_node(JsModule {
-        name: "entry-b.js",
-        size: 1000,
-    });
+    module_by_id.insert(
+        "entry-b.js",
+        JsModule {
+            name: "entry-b.js",
+            size: 1000,
+        },
+    );
 
-    let a_js = g.add_node(JsModule {
-        name: "a.js",
-        size: 1000,
-    });
-    let b_js = g.add_node(JsModule {
-        name: "b.js",
-        size: 1000,
-    });
+    module_by_id.insert(
+        "a.js",
+        JsModule {
+            name: "a.js",
+            size: 1000,
+        },
+    );
+    module_by_id.insert(
+        "b.js",
+        JsModule {
+            name: "b.js",
+            size: 1000,
+        },
+    );
 
-    let shared_js = g.add_node(JsModule {
-        name: "shared.js",
-        size: 1000,
-    });
+    module_by_id.insert(
+        "shared.js",
+        JsModule {
+            name: "shared.js",
+            size: 1000,
+        },
+    );
 
-    let asynced_a_js = g.add_node(JsModule {
-        name: "asynced_a.js",
-        size: 1000,
-    });
+    module_by_id.insert(
+        "asynced_a.js",
+        JsModule {
+            name: "asynced_a.js",
+            size: 1000,
+        },
+    );
+
+    let entry_a_js = g.add_node("entry-a.js");
+
+    let entry_b_js = g.add_node("entry-b.js");
+
+    let a_js = g.add_node("a.js");
+    let b_js = g.add_node("b.js");
+
+    let shared_js = g.add_node("shared.js");
+
+    let asynced_a_js = g.add_node("asynced_a.js");
 
     g.add_edge(entry_a_js, a_js, Dependency { is_async: false });
     g.add_edge(entry_a_js, asynced_a_js, Dependency { is_async: true });
@@ -279,5 +326,5 @@ fn build_graph<'a>() -> (Graph<JsModule<'a>, Dependency>, Vec<NodeIndex>) {
     entries.push(entry_a_js);
     entries.push(entry_b_js);
 
-    return (g, entries);
+    return (g, entries, module_by_id);
 }
